@@ -1,0 +1,366 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { createClient } from "@/lib/supabase/server";
+import { createAdminClient } from "@/lib/supabase/admin";
+import { requireAdmin } from "@/lib/db/helpers";
+import { categorySchema, fieldErrors, productSchema } from "@/lib/validations";
+import { generateSku } from "@/lib/utils";
+import { restoreStockForOrder } from "@/lib/orders";
+import type {
+  OrderStatus,
+  PaymentStatus,
+  UserRole,
+} from "@/lib/types";
+
+type ActionResponse = {
+  ok: boolean;
+  error?: string;
+  id?: string;
+  data?: Partial<Record<string, string[]>>;
+};
+
+const ALLOWED_STATUS_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
+  pending: ["confirmed", "cancelled"],
+  confirmed: ["pending", "processing", "cancelled"],
+  processing: ["confirmed", "shipped", "cancelled"],
+  shipped: ["processing", "delivered", "cancelled"],
+  delivered: ["shipped", "returned"],
+  cancelled: [],
+  returned: [],
+};
+
+const ALLOWED_PAYMENT_TRANSITIONS: Record<PaymentStatus, PaymentStatus[]> = {
+  pending: ["paid", "failed"],
+  paid: ["refunded"],
+  failed: ["pending", "paid"],
+  refunded: ["paid"],
+};
+
+export async function updateOrderStatus(
+  orderId: string,
+  nextStatus: OrderStatus
+): Promise<ActionResponse> {
+  await requireAdmin();
+
+  const supabase = await createClient();
+  const { data: order } = await supabase
+    .from("orders")
+    .select("id,order_status")
+    .eq("id", orderId)
+    .single();
+
+  if (!order) return { ok: false, error: "Order not found." };
+
+  const allowedFrom = order.order_status as OrderStatus;
+  if (!ALLOWED_STATUS_TRANSITIONS[allowedFrom]?.includes(nextStatus)) {
+    return {
+      ok: false,
+      error: `Cannot change an order from "${allowedFrom}" to "${nextStatus}".`,
+    };
+  }
+
+  const { error: updateError } = await supabase
+    .from("orders")
+    .update({ order_status: nextStatus })
+    .eq("id", orderId);
+
+  if (updateError) return { ok: false, error: "Could not update the order." };
+
+  // Restore stock when an order is cancelled or returned.
+  if (nextStatus === "cancelled" || nextStatus === "returned") {
+    await restoreStockForOrder(orderId);
+  }
+
+  revalidatePath("/admin/orders");
+  revalidatePath("/admin");
+  return { ok: true };
+}
+
+export async function updatePaymentStatus(
+  orderId: string,
+  nextStatus: PaymentStatus
+): Promise<ActionResponse> {
+  await requireAdmin();
+
+  const supabase = await createClient();
+  const { data: order } = await supabase
+    .from("orders")
+    .select("id,payment_status,order_status")
+    .eq("id", orderId)
+    .single();
+
+  if (!order) return { ok: false, error: "Order not found." };
+
+  const from = order.payment_status as PaymentStatus;
+  if (!ALLOWED_PAYMENT_TRANSITIONS[from]?.includes(nextStatus)) {
+    return {
+      ok: false,
+      error: `Cannot change payment from "${from}" to "${nextStatus}".`,
+    };
+  }
+
+  const updates: Record<string, unknown> = { payment_status: nextStatus };
+  if (nextStatus === "paid" && (order.order_status as string) === "pending") {
+    updates.order_status = "confirmed";
+  }
+
+  const { error } = await supabase
+    .from("orders")
+    .update(updates)
+    .eq("id", orderId);
+
+  if (error) return { ok: false, error: "Could not update payment status." };
+
+  revalidatePath("/admin/orders");
+  revalidatePath("/admin");
+  return { ok: true };
+}
+
+export async function saveProduct(
+  payload: unknown,
+  productId?: string
+): Promise<ActionResponse> {
+  await requireAdmin();
+
+  const parsed = productSchema.safeParse(payload);
+  if (!parsed.success) {
+    return { ok: false, error: "Invalid product data.", data: fieldErrors(parsed.error) };
+  }
+
+  const d = parsed.data;
+  const supabase = await createClient();
+
+  const base = {
+    name: d.name,
+    slug: d.slug,
+    description: d.description || null,
+    price: d.price,
+    compare_at_price: d.compare_at_price || null,
+    category_id: d.category_id,
+    main_image: d.main_image || d.images[0]?.image_url || null,
+    active: d.active,
+    featured: d.featured,
+  };
+
+  let savedId = productId;
+
+  if (productId) {
+    const { error } = await supabase
+      .from("products")
+      .update({ ...base, updated_at: new Date().toISOString() })
+      .eq("id", productId);
+    if (error) return { ok: false, error: "Could not update the product." };
+  } else {
+    const { data, error } = await supabase
+      .from("products")
+      .insert(base)
+      .select("id")
+      .single();
+    if (error || !data) return { ok: false, error: "Could not create the product." };
+    savedId = data.id as string;
+  }
+
+  // Upsert variants (existing ones updated, new ones created, missing ones deactivated).
+  const keptVariantIds: string[] = [];
+  for (const v of d.variants) {
+    const variantData = {
+      size: v.size || null,
+      color: v.color || null,
+      sku: v.sku || generateSku(d.name, v.size ?? null, v.color ?? null),
+      stock_quantity: v.stock_quantity,
+      price: v.price || null,
+      active: v.active,
+    };
+    if (v.id) {
+      keptVariantIds.push(v.id);
+      await supabase
+        .from("product_variants")
+        .update(variantData)
+        .eq("id", v.id)
+        .eq("product_id", savedId);
+    } else {
+      const { data: inserted } = await supabase
+        .from("product_variants")
+        .insert({ product_id: savedId, ...variantData })
+        .select("id")
+        .single();
+      if (inserted) keptVariantIds.push(inserted.id as string);
+    }
+  }
+
+  if (keptVariantIds.length > 0) {
+    await supabase
+      .from("product_variants")
+      .update({ active: false })
+      .eq("product_id", savedId)
+      .not("id", "in", `(${keptVariantIds.join(",")})`);
+  }
+
+  // Replace the image gallery.
+  await supabase
+    .from("product_images")
+    .delete()
+    .eq("product_id", savedId);
+  if (d.images.length > 0) {
+    await supabase.from("product_images").insert(
+      d.images.map((img, i) => ({
+        product_id: savedId,
+        image_url: img.image_url,
+        sort_order: img.sort_order ?? i,
+      }))
+    );
+  }
+
+  revalidatePath("/admin/products");
+  revalidatePath("/admin/inventory");
+  revalidatePath("/shop");
+  revalidatePath("/product");
+  revalidatePath("/");
+  return { ok: true, id: savedId };
+}
+
+export async function deleteProduct(productId: string): Promise<ActionResponse> {
+  await requireAdmin();
+  const supabase = await createClient();
+  const { error } = await supabase
+    .from("products")
+    .delete()
+    .eq("id", productId);
+  if (error) return { ok: false, error: "Could not delete the product." };
+
+  revalidatePath("/admin/products");
+  revalidatePath("/admin/inventory");
+  revalidatePath("/shop");
+  return { ok: true };
+}
+
+export async function saveCategory(
+  payload: unknown,
+  categoryId?: string
+): Promise<ActionResponse> {
+  await requireAdmin();
+
+  const parsed = categorySchema.safeParse(payload);
+  if (!parsed.success) {
+    return { ok: false, error: "Invalid category data.", data: fieldErrors(parsed.error) };
+  }
+  const d = parsed.data;
+  const admin = createAdminClient();
+  const base = {
+    name: d.name,
+    slug: d.slug,
+    description: d.description || null,
+    image: d.image || null,
+    active: d.active,
+  };
+
+  if (categoryId) {
+    const { error } = await admin
+      .from("categories")
+      .update(base)
+      .eq("id", categoryId);
+    if (error) return { ok: false, error: "Could not update the category." };
+  } else {
+    const { data, error } = await admin
+      .from("categories")
+      .insert(base)
+      .select("id")
+      .single();
+    if (error || !data) return { ok: false, error: "Could not create the category." };
+    categoryId = data.id as string;
+  }
+
+  revalidatePath("/admin/categories");
+  revalidatePath("/shop");
+  revalidatePath("/");
+  return { ok: true, id: categoryId };
+}
+
+export async function deleteCategory(categoryId: string): Promise<ActionResponse> {
+  await requireAdmin();
+  const supabase = await createClient();
+  const { error } = await supabase
+    .from("categories")
+    .delete()
+    .eq("id", categoryId);
+  if (error) return { ok: false, error: "Could not delete the category." };
+
+  revalidatePath("/admin/categories");
+  revalidatePath("/shop");
+  return { ok: true };
+}
+
+export async function updateVariantStock(
+  variantId: string,
+  stock: number
+): Promise<ActionResponse> {
+  await requireAdmin();
+  if (stock < 0 || !Number.isFinite(stock)) {
+    return { ok: false, error: "Stock must be a valid number." };
+  }
+  const supabase = await createClient();
+  const { error } = await supabase
+    .from("product_variants")
+    .update({ stock_quantity: Math.floor(stock) })
+    .eq("id", variantId);
+  if (error) return { ok: false, error: "Could not update stock." };
+
+  revalidatePath("/admin/inventory");
+  revalidatePath("/admin/products");
+  return { ok: true };
+}
+
+export async function setUserRole(
+  userId: string,
+  role: UserRole
+): Promise<ActionResponse> {
+  await requireAdmin();
+  const supabase = await createClient();
+  const { error } = await supabase
+    .from("profiles")
+    .update({ role })
+    .eq("id", userId);
+  if (error) return { ok: false, error: "Could not update the user role." };
+
+  revalidatePath("/admin/customers");
+  revalidatePath("/admin/settings");
+  return { ok: true };
+}
+
+/**
+ * Uploads a product image to the public 'product-images' Supabase bucket
+ * using the service-role client so RLS admin-only policies are satisfied.
+ * Returns the public URL.
+ */
+export async function uploadProductImage(
+  formData: FormData
+): Promise<ActionResponse> {
+  await requireAdmin();
+
+  const file = formData.get("file");
+  if (!(file instanceof File) || file.size === 0) {
+    return { ok: false, error: "No file provided." };
+  }
+  if (file.size > 5 * 1024 * 1024) {
+    return { ok: false, error: "Image must be under 5MB." };
+  }
+
+  const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-80);
+  const ext = safeName.split(".").pop()?.toLowerCase() ?? "jpg";
+  const folder = String(formData.get("folder") || "general").replace(/\W/g, "_");
+  const path = `${folder}/${crypto.randomUUID()}.${ext}`;
+
+  const admin = createAdminClient();
+  const { error } = await admin.storage
+    .from("product-images")
+    .upload(path, file, { contentType: file.type, upsert: false });
+
+  if (error) return { ok: false, error: error.message };
+
+  const { data } = admin.storage.from("product-images").getPublicUrl(path);
+  if (!data) return { ok: false, error: "Could not generate a public URL." };
+
+  revalidatePath("/admin/products");
+  return { ok: true, id: data.publicUrl };
+}
