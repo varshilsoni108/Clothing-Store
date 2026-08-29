@@ -96,14 +96,12 @@ export async function loginWithGoogle() {
   });
 
   if (error) {
-    return { message: error.message };
+    throw new Error(error.message);
   }
 
   if (data.url) {
     redirect(data.url);
   }
-
-  return { message: "Could not start Google sign-in." };
 }
 export async function logout() {
   const supabase = await createClient();
