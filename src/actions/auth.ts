@@ -38,7 +38,7 @@ export async function signup(
     password: parsed.data.password,
     options: {
       data: { full_name: parsed.data.full_name },
-      emailRedirectTo: `${appUrl()}/login?confirm=1`,
+      emailRedirectTo: `${appUrl()}/auth/callback`,
     },
   });
 
@@ -85,7 +85,26 @@ export async function login(
   revalidatePath("/", "layout");
   return { success: true };
 }
+export async function loginWithGoogle() {
+  const supabase = await createClient();
 
+  const { data, error } = await supabase.auth.signInWithOAuth({
+    provider: "google",
+    options: {
+      redirectTo: `${appUrl()}/auth/callback`,
+    },
+  });
+
+  if (error) {
+    return { message: error.message };
+  }
+
+  if (data.url) {
+    redirect(data.url);
+  }
+
+  return { message: "Could not start Google sign-in." };
+}
 export async function logout() {
   const supabase = await createClient();
   await supabase.auth.signOut();

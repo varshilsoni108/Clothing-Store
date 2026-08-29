@@ -3,7 +3,13 @@
 import Link from "next/link";
 import { useActionState, useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { signup, login, forgotPassword, updatePassword } from "@/actions/auth";
+import {
+  signup,
+  login,
+  loginWithGoogle,
+  forgotPassword,
+  updatePassword,
+} from "@/actions/auth";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import type { ActionState } from "@/lib/types";
@@ -31,16 +37,21 @@ function firstError(state: ActionState<FieldName>, field: FieldName) {
   return state.errors?.[field]?.[0];
 }
 
+
 function LoginCard({ redirectTo }: { redirectTo?: string }) {
   const router = useRouter();
   const [state, action, pending] = useActionState(login, {});
-  const needsEmailConfirm = state.success === true && state.session === false;
+  const needsEmailConfirm =
+    state.success === true && state.session === false;
 
   useEffect(() => {
     if (!state.success) return;
     if (state.session === false) return;
+
     router.refresh();
-    router.push(redirectTo && redirectTo.startsWith("/") ? redirectTo : "/");
+    router.push(
+      redirectTo && redirectTo.startsWith("/") ? redirectTo : "/"
+    );
   }, [state, router, redirectTo]);
 
   return (
@@ -50,39 +61,62 @@ function LoginCard({ redirectTo }: { redirectTo?: string }) {
     >
       {needsEmailConfirm ? (
         <p className="rounded-xl bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
-          Account created! Check your email to confirm your account, then sign in
-          below.
+          Account created! Check your email to confirm your account, then sign
+          in below.
         </p>
       ) : (
-        <form action={action}>
-          <div className="space-y-4">
-            <Input
-              label="Email"
-              name="email"
-              type="email"
-              autoComplete="email"
-              required
-              placeholder="you@example.com"
-              error={firstError(state, "email")}
-            />
-            <Input
-              label="Password"
-              name="password"
-              type="password"
-              autoComplete="current-password"
-              required
-              placeholder="••••••••"
-              error={firstError(state, "password")}
-            />
+        <>
+          <form action={action}>
+            <div className="space-y-4">
+              <Input
+                label="Email"
+                name="email"
+                type="email"
+                autoComplete="email"
+                required
+                placeholder="you@example.com"
+                error={firstError(state, "email")}
+              />
+
+              <Input
+                label="Password"
+                name="password"
+                type="password"
+                autoComplete="current-password"
+                required
+                placeholder="••••••••"
+                error={firstError(state, "password")}
+              />
+            </div>
+
+            {state.message && (
+              <p className="mt-4 rounded-xl bg-red-50 px-4 py-3 text-sm text-red-800">
+                {state.message}
+              </p>
+            )}
+
+            <Button
+              type="submit"
+              fullWidth
+              className="mt-6"
+              loading={pending}
+            >
+              Sign in
+            </Button>
+          </form>
+
+          <div className="my-5 flex items-center gap-3">
+            <div className="h-px flex-1 bg-line" />
+            <span className="text-xs text-muted">OR</span>
+            <div className="h-px flex-1 bg-line" />
           </div>
-          {state.message && (
-            <p className="mt-4 rounded-xl bg-red-50 px-4 py-3 text-sm text-red-800">
-              {state.message}
-            </p>
-          )}
-          <Button type="submit" fullWidth className="mt-6" loading={pending}>
-            Sign in
-          </Button>
+
+          <form action={loginWithGoogle}>
+            <Button type="submit" fullWidth variant="outline">
+              Continue with Google
+            </Button>
+          </form>
+
           <div className="mt-4 flex items-center justify-between text-xs">
             <Link
               href="/forgot-password"
@@ -90,6 +124,7 @@ function LoginCard({ redirectTo }: { redirectTo?: string }) {
             >
               Forgot password?
             </Link>
+
             <Link
               href="/signup"
               className="font-medium text-accent underline-offset-2 hover:underline"
@@ -97,11 +132,12 @@ function LoginCard({ redirectTo }: { redirectTo?: string }) {
               Create account
             </Link>
           </div>
-        </form>
+        </>
       )}
     </AuthShell>
   );
 }
+
 
 function SignupCard() {
   const router = useRouter();
