@@ -1,6 +1,8 @@
+
 "use server";
 
 import { revalidatePath } from "next/cache";
+import { createClient as createSupabaseClient } from "@supabase/supabase-js";
 import { createClient } from "@/lib/supabase/server";
 import { getSessionUser } from "@/lib/db/helpers";
 import { addressSchema, checkoutItemsSchema } from "@/lib/validations";
@@ -21,6 +23,30 @@ export interface CheckoutResponse {
   razorpayOrderId?: string | null;
 }
 
+/**
+ * Server-only Supabase client using the service-role key.
+ *
+ * NEVER use this client in client components or expose the service-role key
+ * through a NEXT_PUBLIC_ variable.
+ */
+function createAdminClient() {
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  if (!supabaseUrl || !serviceRoleKey) {
+    throw new Error(
+      "Supabase service role is not configured. Set SUPABASE_SERVICE_ROLE_KEY in your environment."
+    );
+  }
+
+  return createSupabaseClient(supabaseUrl, serviceRoleKey, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  });
+}
+
 export async function checkoutPlaceOrder(input: {
   items: unknown;
   addressId?: string;
@@ -28,15 +54,21 @@ export async function checkoutPlaceOrder(input: {
   saveAddress?: boolean;
 }): Promise<CheckoutResponse> {
   const user = await getSessionUser();
+
   if (!user) {
-    return { success: false, error: "Please log in to place an order." };
+    return {
+      success: false,
+      error: "Please log in to place an order.",
+    };
   }
 
   const parsedItems = checkoutItemsSchema.safeParse(input.items);
+
   if (!parsedItems.success) {
     return {
       success: false,
-      error: "Your cart is empty or contains items that are no longer available.",
+      error:
+        "Your cart is empty or contains items that are no longer available.",
     };
   }
 
@@ -52,7 +84,14 @@ export async function checkoutPlaceOrder(input: {
       .eq("id", input.addressId)
       .eq("user_id", user.id)
       .single();
-    if (!data) return { success: false, error: "Shipping address not found." };
+
+    if (!data) {
+      return {
+        success: false,
+        error: "Shipping address not found.",
+      };
+    }
+
     address = {
       full_name: data.full_name,
       phone: data.phone,
@@ -65,12 +104,14 @@ export async function checkoutPlaceOrder(input: {
     };
   } else {
     const parsedAddress = addressSchema.safeParse(input.address);
+
     if (!parsedAddress.success) {
       return {
         success: false,
         error: "Please provide a complete shipping address.",
       };
     }
+
     address = parsedAddress.data;
 
     if (input.saveAddress) {
@@ -79,6 +120,7 @@ export async function checkoutPlaceOrder(input: {
         .select("id")
         .eq("user_id", user.id)
         .limit(1);
+
       await supabase.from("addresses").insert({
         user_id: user.id,
         full_name: address.full_name,
@@ -100,7 +142,9 @@ export async function checkoutPlaceOrder(input: {
       items,
       address,
     });
+
     revalidatePath("/cart");
+
     return {
       success: true,
       orderId: result.order.id,
@@ -112,7 +156,10 @@ export async function checkoutPlaceOrder(input: {
   } catch (err) {
     return {
       success: false,
-      error: err instanceof Error ? err.message : "Could not place your order.",
+      error:
+        err instanceof Error
+          ? err.message
+          : "Could not place your order.",
     };
   }
 }
@@ -121,11 +168,22 @@ export async function verifyRazorpayPayment(input: {
   orderId: string;
   paymentId: string;
   signature: string;
-}): Promise<{ success: boolean; error?: string; orderNumber?: string }> {
+}): Promise<{
+  success: boolean;
+  error?: string;
+  orderNumber?: string;
+}> {
   const user = await getSessionUser();
-  if (!user) return { success: false, error: "Not logged in." };
+
+  if (!user) {
+    return {
+      success: false,
+      error: "Not logged in.",
+    };
+  }
 
   const supabase = await createClient();
+
   const { data: order, error } = await supabase
     .from("orders")
     .select("*")
@@ -133,14 +191,23 @@ export async function verifyRazorpayPayment(input: {
     .eq("user_id", user.id)
     .single();
 
-  if (error || !order) return { success: false, error: "Order not found." };
+  if (error || !order) {
+    return {
+      success: false,
+      error: "Order not found.",
+    };
+  }
 
   if (order.payment_status === "paid") {
-    return { success: true, orderNumber: order.order_number };
+    return {
+      success: true,
+      orderNumber: order.order_number,
+    };
   }
 
   if (order.razorpay_order_id) {
     let valid = false;
+
     try {
       valid = verifyPaymentSignature({
         orderId: order.razorpay_order_id,
@@ -150,13 +217,20 @@ export async function verifyRazorpayPayment(input: {
     } catch {
       valid = false;
     }
+
     if (!valid) {
-      return { success: false, error: "Payment verification failed. Please contact support." };
+      return {
+        success: false,
+        error:
+          "Payment verification failed. Please contact support.",
+      };
     }
   } else {
-    // Gateway wasn't configured at order creation — allow a manual capture.
     if (!order.razorpay_payment_id) {
-      return { success: false, error: "This order cannot be verified automatically." };
+      return {
+        success: false,
+        error: "This order cannot be verified automatically.",
+      };
     }
   }
 
@@ -171,7 +245,10 @@ export async function verifyRazorpayPayment(input: {
     .eq("payment_status", "pending");
 
   if (updateError) {
-    return { success: false, error: "Could not update the order." };
+    return {
+      success: false,
+      error: "Could not update the order.",
+    };
   }
 
   // Remove the purchased items from the user's cart.
@@ -179,82 +256,6 @@ export async function verifyRazorpayPayment(input: {
     .from("order_items")
     .select("variant_id")
     .eq("order_id", input.orderId);
-  const { data: cart } = await supabase
-    .from("carts")
-    .select("id")
-    .eq("user_id", user.id)
-    .maybeSingle();
-  if (cart && items) {
-    const variantIds = items.map((i) => i.variant_id).filter(Boolean);
-    if (variantIds.length > 0) {
-      await supabase
-        .from("cart_items")
-        .delete()
-        .eq("cart_id", cart.id as string)
-        .in("variant_id", variantIds);
-    }
-  }
-
-  revalidatePath("/cart");
-  revalidatePath("/account/orders");
-  return { success: true, orderNumber: order.order_number };
-}
-export async function simulatePayment(input: {
-  orderId: string;
-}): Promise<{ success: boolean; error?: string; orderNumber?: string }> {
-  const user = await getSessionUser();
-  if (!user) return { success: false, error: "Not logged in." };
-
-  const supabase = await createClient();
-
-  const { data: order, error } = await supabase
-    .from("orders")
-    .select("id, order_number, payment_status, order_status")
-    .eq("id", input.orderId)
-    .eq("user_id", user.id)
-    .single();
-
-  if (error || !order) {
-    return { success: false, error: "Order not found." };
-  }
-
-  if (order.payment_status === "paid") {
-    return {
-      success: true,
-      orderNumber: order.order_number,
-    };
-  }
-
-  if (order.payment_status !== "pending") {
-    return {
-      success: false,
-      error: "This order is no longer awaiting payment.",
-    };
-  }
-
-  const { error: updateError } = await supabase
-    .from("orders")
-    .update({
-      payment_status: "paid",
-      order_status: "confirmed",
-      razorpay_payment_id: `TEST_${order.id}`,
-    })
-    .eq("id", order.id)
-    .eq("user_id", user.id)
-    .eq("payment_status", "pending");
-
-  if (updateError) {
-    return {
-      success: false,
-      error: "Could not complete the test payment.",
-    };
-  }
-
-  // Remove purchased items from the user's cart.
-  const { data: items } = await supabase
-    .from("order_items")
-    .select("variant_id")
-    .eq("order_id", order.id);
 
   const { data: cart } = await supabase
     .from("carts")
@@ -263,7 +264,9 @@ export async function simulatePayment(input: {
     .maybeSingle();
 
   if (cart && items) {
-    const variantIds = items.map((item) => item.variant_id).filter(Boolean);
+    const variantIds = items
+      .map((item) => item.variant_id)
+      .filter(Boolean);
 
     if (variantIds.length > 0) {
       await supabase
@@ -282,13 +285,189 @@ export async function simulatePayment(input: {
     orderNumber: order.order_number,
   };
 }
+
+/**
+ * Simulated payment gateway.
+ *
+ * This is intentionally server-side and uses the Supabase service-role
+ * client for the payment update because the update must not depend on
+ * the customer's normal RLS permissions.
+ *
+ * NO REAL MONEY IS CHARGED.
+ */
+export async function simulatePayment(input: {
+  orderId: string;
+}): Promise<{
+  success: boolean;
+  error?: string;
+  orderNumber?: string;
+}> {
+  const user = await getSessionUser();
+
+  if (!user) {
+    return {
+      success: false,
+      error: "Not logged in.",
+    };
+  }
+
+  // First use the normal authenticated client to make sure this order
+  // actually belongs to the logged-in customer.
+  const supabase = await createClient();
+
+  const { data: order, error } = await supabase
+    .from("orders")
+    .select("id, order_number, payment_status, order_status")
+    .eq("id", input.orderId)
+    .eq("user_id", user.id)
+    .single();
+
+  if (error || !order) {
+    return {
+      success: false,
+      error: "Order not found.",
+    };
+  }
+
+  if (order.payment_status === "paid") {
+    return {
+      success: true,
+      orderNumber: order.order_number,
+    };
+  }
+
+  if (order.payment_status !== "pending") {
+    return {
+      success: false,
+      error: "This order is no longer awaiting payment.",
+    };
+  }
+
+  try {
+    // Trusted server-side client.
+    const admin = createAdminClient();
+
+    // Mark the simulated payment as successful.
+    const { data: updatedOrder, error: updateError } = await admin
+      .from("orders")
+      .update({
+        payment_status: "paid",
+        order_status: "confirmed",
+        razorpay_payment_id: `TEST_${order.id}`,
+      })
+      .eq("id", order.id)
+      .eq("user_id", user.id)
+      .eq("payment_status", "pending")
+      .select("id, order_number")
+      .single();
+
+    if (updateError || !updatedOrder) {
+      console.error("simulatePayment order update failed:", updateError);
+
+      return {
+        success: false,
+        error: "Could not complete the test payment.",
+      };
+    }
+
+    // Get the purchased variants.
+    const { data: items, error: itemsError } = await admin
+      .from("order_items")
+      .select("variant_id")
+      .eq("order_id", order.id);
+
+    if (itemsError) {
+      console.error(
+        "simulatePayment order_items lookup failed:",
+        itemsError
+      );
+
+      return {
+        success: false,
+        error:
+          "Payment succeeded, but we could not update your cart. Please refresh your account.",
+      };
+    }
+
+    // Find the customer's cart.
+    const { data: cart, error: cartError } = await admin
+      .from("carts")
+      .select("id")
+      .eq("user_id", user.id)
+      .maybeSingle();
+
+    if (cartError) {
+      console.error(
+        "simulatePayment cart lookup failed:",
+        cartError
+      );
+
+      return {
+        success: false,
+        error:
+          "Payment succeeded, but we could not update your cart. Please refresh your account.",
+      };
+    }
+
+    // Remove purchased items from the cart.
+    if (cart && items) {
+      const variantIds = items
+        .map((item) => item.variant_id)
+        .filter(Boolean);
+
+      if (variantIds.length > 0) {
+        const { error: deleteError } = await admin
+          .from("cart_items")
+          .delete()
+          .eq("cart_id", cart.id as string)
+          .in("variant_id", variantIds);
+
+        if (deleteError) {
+          console.error(
+            "simulatePayment cart cleanup failed:",
+            deleteError
+          );
+        }
+      }
+    }
+
+    revalidatePath("/cart");
+    revalidatePath("/account/orders");
+    revalidatePath(`/account/orders/${order.id}`);
+
+    return {
+      success: true,
+      orderNumber: updatedOrder.order_number,
+    };
+  } catch (err) {
+    console.error("simulatePayment failed:", err);
+
+    return {
+      success: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : "Could not complete the test payment.",
+    };
+  }
+}
+
 export async function abandonCheckout(input: {
   orderId: string;
-}): Promise<{ success: boolean; reason?: string }> {
+}): Promise<{
+  success: boolean;
+  reason?: string;
+}> {
   const user = await getSessionUser();
-  if (!user) return { success: false };
+
+  if (!user) {
+    return {
+      success: false,
+    };
+  }
 
   const supabase = await createClient();
+
   const { data: order } = await supabase
     .from("orders")
     .select("id,payment_status,order_status")
@@ -296,14 +475,34 @@ export async function abandonCheckout(input: {
     .eq("user_id", user.id)
     .single();
 
-  if (!order) return { success: false, reason: "not-found" };
-
-  if (order.payment_status === "pending" && order.order_status === "pending") {
-    await restoreStockForOrder(order.id as string);
-    await supabase.from("orders").delete().eq("id", order.id as string);
-    revalidatePath("/cart");
-    return { success: true };
+  if (!order) {
+    return {
+      success: false,
+      reason: "not-found",
+    };
   }
 
-  return { success: false, reason: "already-processed" };
+  if (
+    order.payment_status === "pending" &&
+    order.order_status === "pending"
+  ) {
+    await restoreStockForOrder(order.id as string);
+
+    await supabase
+      .from("orders")
+      .delete()
+      .eq("id", order.id as string);
+
+    revalidatePath("/cart");
+
+    return {
+      success: true,
+    };
+  }
+
+  return {
+    success: false,
+    reason: "already-processed",
+  };
 }
+
