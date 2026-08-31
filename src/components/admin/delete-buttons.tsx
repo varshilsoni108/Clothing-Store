@@ -14,16 +14,20 @@ export function DeleteProductButton({
   productId: string;
   name: string;
 }) {
+  const router = useRouter();
   const [open, setOpen] = useState(false);
   const [pending, setPending] = useState(false);
   const { toast } = useToast();
 
   async function confirm() {
     setPending(true);
+
     try {
       const res = await deleteProduct(productId);
+
       if (res.ok) {
         toast("Product deleted.", "success");
+        router.refresh();
       } else {
         toast(res.error ?? "Could not delete.", "error");
       }
@@ -42,6 +46,7 @@ export function DeleteProductButton({
       >
         <Trash2 className="h-4 w-4" />
       </button>
+
       <ConfirmDialog
         open={open}
         onClose={() => setOpen(false)}
@@ -70,8 +75,10 @@ export function DeleteCategoryButton({
 
   async function confirm() {
     setPending(true);
+
     try {
       const res = await deleteCategory(categoryId);
+
       if (res.ok) {
         toast("Category deleted.", "success");
         router.refresh();
@@ -93,6 +100,7 @@ export function DeleteCategoryButton({
       >
         <Trash2 className="h-4 w-4" />
       </button>
+
       <ConfirmDialog
         open={open}
         onClose={() => setOpen(false)}

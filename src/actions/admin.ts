@@ -220,19 +220,163 @@ export async function saveProduct(
   return { ok: true, id: savedId };
 }
 
-export async function deleteProduct(productId: string): Promise<ActionResponse> {
+export async function deleteProduct(
+  productId: string
+): Promise<ActionResponse> {
   await requireAdmin();
+
   const supabase = await createClient();
-  const { error } = await supabase
+
+  // 1. Make sure the product exists.
+  const { data: product, error: productError } = await supabase
+    .from("products")
+    .select("id")
+    .eq("id", productId)
+    .single();
+
+  if (productError || !product) {
+    return {
+      ok: false,
+      error: "Product not found.",
+    };
+  }
+
+  // 2. Get all variants belonging to this product.
+  const { data: variants, error: variantsError } = await supabase
+    .from("product_variants")
+    .select("id")
+    .eq("product_id", productId);
+
+  if (variantsError) {
+    return {
+      ok: false,
+      error: "Could not check the product variants.",
+    };
+  }
+
+  const variantIds = (variants ?? []).map((v) => v.id as string);
+
+  // 3. Check whether any of those variants have appeared in an order.
+  let hasOrderHistory = false;
+
+  if (variantIds.length > 0) {
+    const { data: orderItems, error: orderItemsError } = await supabase
+      .from("order_items")
+      .select("id")
+      .in("variant_id", variantIds)
+      .limit(1);
+
+    if (orderItemsError) {
+      return {
+        ok: false,
+        error: "Could not check the product order history.",
+      };
+    }
+
+    hasOrderHistory = (orderItems?.length ?? 0) > 0;
+  }
+
+  // 4. If the product has order history, NEVER hard-delete it.
+  //    Keep it for historical orders and simply deactivate it.
+  if (hasOrderHistory) {
+    const { error: archiveError } = await supabase
+      .from("products")
+      .update({
+        active: false,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", productId);
+
+    if (archiveError) {
+      return {
+        ok: false,
+        error: "Could not archive the product.",
+      };
+    }
+
+    // Also deactivate all its variants.
+    if (variantIds.length > 0) {
+      await supabase
+        .from("product_variants")
+        .update({ active: false })
+        .in("id", variantIds);
+    }
+
+    revalidatePath("/admin/products");
+    revalidatePath("/admin/inventory");
+    revalidatePath("/shop");
+    revalidatePath("/");
+
+    return {
+      ok: true,
+    };
+  }
+
+  // 5. Product has never been ordered.
+  //    Remove it completely.
+
+  // Remove variants from carts first.
+  if (variantIds.length > 0) {
+    const { error: cartError } = await supabase
+      .from("cart_items")
+      .delete()
+      .in("variant_id", variantIds);
+
+    if (cartError) {
+      return {
+        ok: false,
+        error: "Could not remove the product from carts.",
+      };
+    }
+  }
+
+  // Remove product images.
+  const { error: imagesError } = await supabase
+    .from("product_images")
+    .delete()
+    .eq("product_id", productId);
+
+  if (imagesError) {
+    return {
+      ok: false,
+      error: "Could not remove the product images.",
+    };
+  }
+
+  // Remove variants.
+  const { error: variantsDeleteError } = await supabase
+    .from("product_variants")
+    .delete()
+    .eq("product_id", productId);
+
+  if (variantsDeleteError) {
+    return {
+      ok: false,
+      error: "Could not remove the product variants.",
+    };
+  }
+
+  // Finally remove the product itself.
+  const { error: deleteError } = await supabase
     .from("products")
     .delete()
     .eq("id", productId);
-  if (error) return { ok: false, error: "Could not delete the product." };
+
+  if (deleteError) {
+    return {
+      ok: false,
+      error: "Could not delete the product.",
+    };
+  }
 
   revalidatePath("/admin/products");
   revalidatePath("/admin/inventory");
   revalidatePath("/shop");
-  return { ok: true };
+  revalidatePath("/");
+
+  return {
+    ok: true,
+  };
 }
 
 export async function saveCategory(
