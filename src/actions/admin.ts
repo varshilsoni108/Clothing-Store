@@ -124,12 +124,20 @@ export async function saveProduct(
   await requireAdmin();
 
   const parsed = productSchema.safeParse(payload);
+
   if (!parsed.success) {
-    return { ok: false, error: "Invalid product data.", data: fieldErrors(parsed.error) };
+    return {
+      ok: false,
+      error: "Invalid product data.",
+      data: fieldErrors(parsed.error),
+    };
   }
 
   const d = parsed.data;
-  const supabase = await createClient();
+
+  // requireAdmin() has already verified the user.
+  // Admin client avoids RLS failures for admin CRUD operations.
+  const supabase = createAdminClient();
 
   const base = {
     name: d.name,
@@ -137,7 +145,7 @@ export async function saveProduct(
     description: d.description || null,
     price: d.price,
     compare_at_price: d.compare_at_price || null,
-    category_id: d.category_id,
+    category_id: d.category_id || null,
     main_image: d.main_image || d.images[0]?.image_url || null,
     active: d.active,
     featured: d.featured,
@@ -145,79 +153,196 @@ export async function saveProduct(
 
   let savedId = productId;
 
+  // --------------------------------------------------
+  // CREATE / UPDATE PRODUCT
+  // --------------------------------------------------
+
   if (productId) {
     const { error } = await supabase
       .from("products")
-      .update({ ...base, updated_at: new Date().toISOString() })
+      .update({
+        ...base,
+        updated_at: new Date().toISOString(),
+      })
       .eq("id", productId);
-    if (error) return { ok: false, error: "Could not update the product." };
+
+    if (error) {
+      console.error("Product update error:", error);
+
+      return {
+        ok: false,
+        error: `Could not update the product: ${error.message}`,
+      };
+    }
   } else {
     const { data, error } = await supabase
       .from("products")
       .insert(base)
       .select("id")
       .single();
-    if (error || !data) return { ok: false, error: "Could not create the product." };
+
+    if (error || !data) {
+      console.error("Product creation error:", error);
+
+      return {
+        ok: false,
+        error: error
+          ? `Could not create the product: ${error.message}`
+          : "Could not create the product.",
+      };
+    }
+
     savedId = data.id as string;
   }
 
-  // Upsert variants (existing ones updated, new ones created, missing ones deactivated).
+  if (!savedId) {
+    return {
+      ok: false,
+      error: "Product ID was not created.",
+    };
+  }
+
+  // --------------------------------------------------
+  // VARIANTS
+  // --------------------------------------------------
+
   const keptVariantIds: string[] = [];
+
   for (const v of d.variants) {
     const variantData = {
       size: v.size || null,
       color: v.color || null,
-      sku: v.sku || generateSku(d.name, v.size ?? null, v.color ?? null),
+      sku:
+        v.sku ||
+        generateSku(
+          d.name,
+          v.size ?? null,
+          v.color ?? null
+        ),
       stock_quantity: v.stock_quantity,
       price: v.price || null,
       active: v.active,
     };
+
     if (v.id) {
-      keptVariantIds.push(v.id);
-      await supabase
+      const { error } = await supabase
         .from("product_variants")
         .update(variantData)
         .eq("id", v.id)
         .eq("product_id", savedId);
+
+      if (error) {
+        console.error("Variant update error:", error);
+
+        return {
+          ok: false,
+          error: `Could not update variant: ${error.message}`,
+        };
+      }
+
+      keptVariantIds.push(v.id);
     } else {
-      const { data: inserted } = await supabase
+      const { data: inserted, error } = await supabase
         .from("product_variants")
-        .insert({ product_id: savedId, ...variantData })
+        .insert({
+          product_id: savedId,
+          ...variantData,
+        })
         .select("id")
         .single();
-      if (inserted) keptVariantIds.push(inserted.id as string);
+
+      if (error || !inserted) {
+        console.error("Variant creation error:", error);
+
+        return {
+          ok: false,
+          error: error
+            ? `Could not create variant: ${error.message}`
+            : "Could not create variant.",
+        };
+      }
+
+      keptVariantIds.push(inserted.id as string);
     }
   }
 
+  // Deactivate variants removed from the form.
   if (keptVariantIds.length > 0) {
-    await supabase
+    const { error } = await supabase
       .from("product_variants")
       .update({ active: false })
       .eq("product_id", savedId)
       .not("id", "in", `(${keptVariantIds.join(",")})`);
+
+    if (error) {
+      console.error("Variant cleanup error:", error);
+
+      return {
+        ok: false,
+        error: `Could not update old variants: ${error.message}`,
+      };
+    }
   }
 
-  // Replace the image gallery.
-  await supabase
+  // --------------------------------------------------
+  // PRODUCT IMAGES
+  // --------------------------------------------------
+
+  const { error: deleteImagesError } = await supabase
     .from("product_images")
     .delete()
     .eq("product_id", savedId);
-  if (d.images.length > 0) {
-    await supabase.from("product_images").insert(
-      d.images.map((img, i) => ({
-        product_id: savedId,
-        image_url: img.image_url,
-        sort_order: img.sort_order ?? i,
-      }))
+
+  if (deleteImagesError) {
+    console.error(
+      "Product image cleanup error:",
+      deleteImagesError
     );
+
+    return {
+      ok: false,
+      error: `Could not update product images: ${deleteImagesError.message}`,
+    };
   }
+
+  if (d.images.length > 0) {
+    const { error: imageInsertError } = await supabase
+      .from("product_images")
+      .insert(
+        d.images.map((img, i) => ({
+          product_id: savedId,
+          image_url: img.image_url,
+          sort_order: img.sort_order ?? i,
+        }))
+      );
+
+    if (imageInsertError) {
+      console.error(
+        "Product image insert error:",
+        imageInsertError
+      );
+
+      return {
+        ok: false,
+        error: `Could not save product images: ${imageInsertError.message}`,
+      };
+    }
+  }
+
+  // --------------------------------------------------
+  // CACHE REFRESH
+  // --------------------------------------------------
 
   revalidatePath("/admin/products");
   revalidatePath("/admin/inventory");
   revalidatePath("/shop");
   revalidatePath("/product");
   revalidatePath("/");
-  return { ok: true, id: savedId };
+
+  return {
+    ok: true,
+    id: savedId,
+  };
 }
 
 export async function deleteProduct(
@@ -225,7 +350,7 @@ export async function deleteProduct(
 ): Promise<ActionResponse> {
   await requireAdmin();
 
-  const supabase = await createClient();
+  const supabase = createAdminClient();
 
   // 1. Make sure the product exists.
   const { data: product, error: productError } = await supabase
@@ -423,7 +548,7 @@ export async function saveCategory(
 
 export async function deleteCategory(categoryId: string): Promise<ActionResponse> {
   await requireAdmin();
-  const supabase = await createClient();
+  const supabase = createAdminClient();
   const { error } = await supabase
     .from("categories")
     .delete()
@@ -440,18 +565,35 @@ export async function updateVariantStock(
   stock: number
 ): Promise<ActionResponse> {
   await requireAdmin();
-  if (stock < 0 || !Number.isFinite(stock)) {
-    return { ok: false, error: "Stock must be a valid number." };
+
+  if (!Number.isFinite(stock) || stock < 0) {
+    return {
+      ok: false,
+      error: "Stock must be a valid number.",
+    };
   }
-  const supabase = await createClient();
-  const { error } = await supabase
+
+  const admin = createAdminClient();
+
+  const { error } = await admin
     .from("product_variants")
-    .update({ stock_quantity: Math.floor(stock) })
+    .update({
+      stock_quantity: Math.floor(stock),
+    })
     .eq("id", variantId);
-  if (error) return { ok: false, error: "Could not update stock." };
+
+  if (error) {
+    console.error("Stock update error:", error);
+
+    return {
+      ok: false,
+      error: `Could not update stock: ${error.message}`,
+    };
+  }
 
   revalidatePath("/admin/inventory");
   revalidatePath("/admin/products");
+
   return { ok: true };
 }
 
@@ -483,28 +625,85 @@ export async function uploadProductImage(
   await requireAdmin();
 
   const file = formData.get("file");
+
   if (!(file instanceof File) || file.size === 0) {
-    return { ok: false, error: "No file provided." };
-  }
-  if (file.size > 5 * 1024 * 1024) {
-    return { ok: false, error: "Image must be under 5MB." };
+    return {
+      ok: false,
+      error: "No file provided.",
+    };
   }
 
-  const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-80);
-  const ext = safeName.split(".").pop()?.toLowerCase() ?? "jpg";
-  const folder = String(formData.get("folder") || "general").replace(/\W/g, "_");
+  if (!file.type.startsWith("image/")) {
+    return {
+      ok: false,
+      error: "Please upload an image file.",
+    };
+  }
+
+  if (file.size > 5 * 1024 * 1024) {
+    return {
+      ok: false,
+      error: "Image must be under 5MB.",
+    };
+  }
+
+  const safeName = file.name
+    .replace(/[^a-zA-Z0-9._-]/g, "_")
+    .slice(-80);
+
+  const ext =
+    safeName.split(".").pop()?.toLowerCase() || "jpg";
+
+  const folder = String(formData.get("folder") || "general")
+    .replace(/\W/g, "_");
+
   const path = `${folder}/${crypto.randomUUID()}.${ext}`;
 
-  const admin = createAdminClient();
-  const { error } = await admin.storage
-    .from("product-images")
-    .upload(path, file, { contentType: file.type, upsert: false });
+  try {
+    const admin = createAdminClient();
 
-  if (error) return { ok: false, error: error.message };
+    const { error: uploadError } = await admin.storage
+      .from("product-images")
+      .upload(path, file, {
+        contentType: file.type,
+        upsert: false,
+      });
 
-  const { data } = admin.storage.from("product-images").getPublicUrl(path);
-  if (!data) return { ok: false, error: "Could not generate a public URL." };
+    if (uploadError) {
+      console.error("Supabase storage upload error:", uploadError);
 
-  revalidatePath("/admin/products");
-  return { ok: true, id: data.publicUrl };
+      return {
+        ok: false,
+        error: `Image upload failed: ${uploadError.message}`,
+      };
+    }
+
+    const { data } = admin.storage
+      .from("product-images")
+      .getPublicUrl(path);
+
+    if (!data?.publicUrl) {
+      return {
+        ok: false,
+        error: "Could not generate the image URL.",
+      };
+    }
+
+    revalidatePath("/admin/products");
+
+    return {
+      ok: true,
+      id: data.publicUrl,
+    };
+  } catch (error) {
+    console.error("Product image upload exception:", error);
+
+    return {
+      ok: false,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Could not upload the image.",
+    };
+  }
 }

@@ -20,18 +20,36 @@ export function ProductImageUpload({
       toast("Please pick an image file.", "error");
       return;
     }
+
+    if (file.size > 5 * 1024 * 1024) {
+      toast("Image must be under 5MB.", "error");
+      return;
+    }
+
     setPending(true);
+
     try {
       const fd = new FormData();
       fd.set("file", file);
       fd.set("folder", "products");
+
       const res = await uploadProductImage(fd);
+
       if (res.ok && res.id) {
         onUploaded(res.id);
         toast("Image uploaded.", "success");
       } else {
         toast(res.error ?? "Upload failed.", "error");
       }
+    } catch (error) {
+      console.error("Product image upload error:", error);
+
+      toast(
+        error instanceof Error
+          ? error.message
+          : "Could not upload the image.",
+        "error"
+      );
     } finally {
       setPending(false);
     }
@@ -45,11 +63,16 @@ export function ProductImageUpload({
         accept="image/*"
         className="hidden"
         onChange={(e) => {
-          const f = e.target.files?.[0];
-          if (f) handleFile(f);
+          const file = e.target.files?.[0];
+
+          if (file) {
+            void handleFile(file);
+          }
+
           e.target.value = "";
         }}
       />
+
       <Button
         variant="outline"
         size="sm"
