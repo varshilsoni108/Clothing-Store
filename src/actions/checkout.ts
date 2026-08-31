@@ -199,7 +199,89 @@ export async function verifyRazorpayPayment(input: {
   revalidatePath("/account/orders");
   return { success: true, orderNumber: order.order_number };
 }
+export async function simulatePayment(input: {
+  orderId: string;
+}): Promise<{ success: boolean; error?: string; orderNumber?: string }> {
+  const user = await getSessionUser();
+  if (!user) return { success: false, error: "Not logged in." };
 
+  const supabase = await createClient();
+
+  const { data: order, error } = await supabase
+    .from("orders")
+    .select("id, order_number, payment_status, order_status")
+    .eq("id", input.orderId)
+    .eq("user_id", user.id)
+    .single();
+
+  if (error || !order) {
+    return { success: false, error: "Order not found." };
+  }
+
+  if (order.payment_status === "paid") {
+    return {
+      success: true,
+      orderNumber: order.order_number,
+    };
+  }
+
+  if (order.payment_status !== "pending") {
+    return {
+      success: false,
+      error: "This order is no longer awaiting payment.",
+    };
+  }
+
+  const { error: updateError } = await supabase
+    .from("orders")
+    .update({
+      payment_status: "paid",
+      order_status: "confirmed",
+      razorpay_payment_id: `TEST_${order.id}`,
+    })
+    .eq("id", order.id)
+    .eq("user_id", user.id)
+    .eq("payment_status", "pending");
+
+  if (updateError) {
+    return {
+      success: false,
+      error: "Could not complete the test payment.",
+    };
+  }
+
+  // Remove purchased items from the user's cart.
+  const { data: items } = await supabase
+    .from("order_items")
+    .select("variant_id")
+    .eq("order_id", order.id);
+
+  const { data: cart } = await supabase
+    .from("carts")
+    .select("id")
+    .eq("user_id", user.id)
+    .maybeSingle();
+
+  if (cart && items) {
+    const variantIds = items.map((item) => item.variant_id).filter(Boolean);
+
+    if (variantIds.length > 0) {
+      await supabase
+        .from("cart_items")
+        .delete()
+        .eq("cart_id", cart.id as string)
+        .in("variant_id", variantIds);
+    }
+  }
+
+  revalidatePath("/cart");
+  revalidatePath("/account/orders");
+
+  return {
+    success: true,
+    orderNumber: order.order_number,
+  };
+}
 export async function abandonCheckout(input: {
   orderId: string;
 }): Promise<{ success: boolean; reason?: string }> {
